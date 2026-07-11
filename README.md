@@ -1,6 +1,6 @@
 # AR Table Tennis
 
-[![Python](https://img.shields.io/badge/python-FFD43B?style=for-the-badge&logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-FFD43B?style=for-the-badge&logo=python)][python]
 [![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?style=for-the-badge&logo=opencv)](https://opencv.org/)
 [![MediaPipe](https://img.shields.io/badge/MediaPipe-0097A7?style=for-the-badge&logo=mediapipe&logoColor=74D3E0)](https://developers.google.com/edge/mediapipe/solutions/guide)
 [![Numpy](https://img.shields.io/badge/Numpy-013243?style=for-the-badge&logo=numpy&logoColor=white)](https://numpy.org/)
@@ -25,9 +25,17 @@
 
 > [!NOTE]
 > **Prerequisite**:
-> - [Python](https://www.python.org/)
-> - [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/system-requirements) (add to PATH variable if you want to run `conda` in your usual terminal)
-> - [Git](https://git-scm.com)
+> - [Python][python]
+> - [Miniconda][miniconda] [^1] (add to PATH variable if you want to run `conda` in your usual terminal)
+> - [Git][git]
+
+[python]: https://www.python.org/
+[miniconda]: https://www.anaconda.com/docs/getting-started/miniconda/system-requirements
+[git]: https://git-scm.com
+
+[^1]: [Miniconda][miniconda] is very beginner friendly. However, if you are comfortable in managing your environment and dependencies with [`pip`][python-venv], do so!
+
+[python-venv]: https://docs.python.org/3/library/venv.html
 
 1. Clone repository
     ```sh
