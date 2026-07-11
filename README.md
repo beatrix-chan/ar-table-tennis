@@ -59,7 +59,7 @@
     ```sh
     ```
 
-And a GUI should pop up, enjoy!
+And a GUI should pop up, have fun!
 
 ## Usage
 
