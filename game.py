@@ -24,20 +24,20 @@ from mediapipe.tasks.python import vision
 
 
 class SVGLoader:
-    """Load and cache SVG assets as BGRA NumPy arrays.
+    """Load and cache PNG assets as BGRA NumPy arrays.
 
-    Despite the ``.svg`` extension, the asset files are pre-rasterized raster
+    Despite the ``.png`` extension, the asset files are pre-rasterized raster
     buffers decoded via ``cv2.imread`` with ``cv2.IMREAD_UNCHANGED`` so that the
     alpha channel is preserved for fast alpha compositing at runtime.
     """
 
     # (filename, attribute name) for every asset that must be loaded.
     _ASSETS = (
-        ("table-net.svg", "table_net"),
-        ("racket-red.svg", "racket_red"),
-        ("racket-black.svg", "racket_black"),
-        ("ball-white.svg", "ball_white"),
-        ("ball-orange.svg", "ball_orange"),
+        ("table-net.png", "table_net"),
+        ("racket-red.png", "racket_red"),
+        ("racket-black.png", "racket_black"),
+        ("ball-white.png", "ball_white"),
+        ("ball-orange.png", "ball_orange"),
     )
 
     def __init__(self, assets_dir):
@@ -334,12 +334,18 @@ LANDMARK_MIDDLE_MCP = 9
 LANDMARK_PINKY_MCP = 17
 
 
-def create_hand_landmarker(model_path):
+def create_hand_landmarker(model_path: str) -> mp_python.vision.HandLandmarker:
     """Create and configure a MediaPipe HandLandmarker.
 
     Loads the model at ``model_path`` with ``num_hands=1`` and all confidence
     thresholds (detection, presence, tracking) set to 0.5. Raises
     ``SystemExit`` with a clear message if the model file is missing.
+
+    Args:
+        model_path: Path to the hand landmarker model file (.task).
+
+    Returns:
+        A configured HandLandmarker instance ready for landmark detection.
     """
     if not os.path.exists(model_path):
         raise SystemExit(
@@ -1247,6 +1253,12 @@ KEY_SPACE = 32  # Spacebar toggles pause during an active round
 KEY_A_LOWER = 97  # 'a' opens the license overlay
 KEY_A_UPPER = 65  # 'A' opens the license overlay
 
+
+def normalize_key(raw_key):
+    """Normalize key code from cv2.waitKeyEx to match state machine behavior."""
+    return raw_key if raw_key == -1 or raw_key > 255 else (raw_key & 0xFF)
+
+
 # States during which Spacebar is allowed to toggle the pause flag. In every
 # other state (LICENSE, TUTORIAL, WAIT_COUNTDOWN, GAME_OVER) Spacebar is ignored
 # and the pause flag is left untouched.
@@ -1396,7 +1408,11 @@ def tick_state_machine(ctx, dt, landmarks, key, current_time):
             )
             ctx.velocity_buffer.push(palm_center, current_time)
 
-    # (2) Read-only in-game license overlay ('A' to open, any key to dismiss).
+    # (2) Global quit: Escape terminates from any state (Requirement 14.1).
+    if key == KEY_ESCAPE:
+        return "exit"
+
+    # (3) Read-only in-game license overlay ('A' to open, any key to dismiss).
     # It is not applicable to the initial LICENSE acceptance screen, which has
     # its own full-screen rendering. While the overlay is showing, the whole
     # tick is frozen (no timer, ball, or transition updates) and control returns
@@ -1406,9 +1422,6 @@ def tick_state_machine(ctx, dt, landmarks, key, current_time):
         if overlay_action in ("opened", "dismissed") or ctx.license_overlay_active:
             return None
 
-    # (3) Global quit: Escape terminates from any state (Requirement 14.1).
-    if key == KEY_ESCAPE:
-        return "exit"
 
     # (4) Spacebar pause toggle (only honored during active rounds; ignored in
     # LICENSE/TUTORIAL/WAIT_COUNTDOWN/GAME_OVER by handle_pause_input).
@@ -2118,7 +2131,7 @@ CAPTURE_WIDTH = 1280
 CAPTURE_HEIGHT = 720
 
 # Asset and model locations, relative to the project root.
-ASSETS_DIR = "assets"
+ASSETS_DIR = "_ASSETS"
 MODEL_PATH = "hand_landmarker.task"
 
 
@@ -2260,7 +2273,7 @@ def main():
             # real key is masked to its low byte to match the state machine's key
             # codes.
             raw_key = cv2.waitKeyEx(1)
-            key = raw_key if raw_key == -1 or raw_key > 255 else (raw_key & 0xFF)
+            key = normalize_key(raw_key)
 
             # During speed selection (before the countdown starts) sync the speed
             # trackbar into the context so the chosen fall speed is used for the
