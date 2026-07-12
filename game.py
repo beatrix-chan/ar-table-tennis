@@ -692,3 +692,462 @@ def evaluate_score(hit_point, velocity):
     """
     landing_x, landing_y = project_landing_position(hit_point, velocity)
     return is_in_opponent_zone(landing_x, landing_y)
+
+
+# ---------------------------------------------------------------------------
+# LicenseScreen (GPLv3 display + acceptance)
+# ---------------------------------------------------------------------------
+# Loads the GPLv3 ``LICENSE`` file at startup and renders it two ways: as a
+# full-screen acceptance overlay on a dark background (initial LICENSE state)
+# and as a semi-transparent read-only panel drawn over the live game frame
+# (triggered by the 'A' key during gameplay). Text is word-wrapped to the frame
+# width and vertically scrollable via ``scroll_offset``. All rendering uses
+# OpenCV drawing primitives on BGR frames.
+
+
+class LicenseScreen:
+    """Handle GPLv3 license display and acceptance.
+
+    The full license text is loaded from the project-root ``LICENSE`` file at
+    construction time. :meth:`render` draws the acceptance screen, while
+    :meth:`render_overlay` draws a read-only panel over the current game frame.
+    ``scroll_offset`` tracks the index of the first visible (wrapped) line and
+    is clamped to a valid range during rendering.
+    """
+
+    LICENSE_FILE = "LICENSE"
+
+    # Rendering constants (OpenCV putText parameters and layout metrics).
+    _FONT = cv2.FONT_HERSHEY_SIMPLEX
+    _FONT_SCALE = 0.4
+    _FONT_THICKNESS = 1
+    _LINE_HEIGHT = 18            # vertical spacing between text lines (px)
+    _TEXT_COLOR = (220, 220, 220)      # BGR light grey license body text
+    _INSTRUCTION_COLOR = (0, 255, 255)  # BGR yellow instruction text
+    _BG_COLOR = (20, 20, 20)           # BGR dark background fill
+    _MARGIN_X = 40               # left/right margin (px)
+    _TOP_MARGIN = 40             # top margin for first text line (px)
+    _BOTTOM_MARGIN = 60          # reserved band for the instruction (px)
+    _SCROLL_STEP = 3             # lines advanced per scroll key press
+
+    def __init__(self):
+        self.license_text = ""
+        self.accepted = False
+        self.scroll_offset = 0
+        # Maximum valid scroll_offset for the most recent render; updated each
+        # time the text is laid out so handle_input can clamp scrolling.
+        self.max_scroll_offset = 0
+        self.load_license()
+
+    def load_license(self):
+        """Load the GPLv3 text from the project-root ``LICENSE`` file.
+
+        Reads :attr:`LICENSE_FILE` and stores the contents in
+        ``self.license_text``. Raises ``SystemExit`` with a clear message if the
+        file is missing or unreadable, matching the startup error-handling of
+        the other asset loaders.
+        """
+        if not os.path.exists(self.LICENSE_FILE):
+            raise SystemExit(
+                "Error: LICENSE file not found: {}. The GPLv3 license text is "
+                "required before the game can start.".format(self.LICENSE_FILE)
+            )
+        try:
+            with open(self.LICENSE_FILE, "r", encoding="utf-8") as handle:
+                self.license_text = handle.read()
+        except OSError as exc:
+            raise SystemExit(
+                "Error: failed to read LICENSE file {}: {}".format(
+                    self.LICENSE_FILE, exc
+                )
+            )
+
+    def _wrap_text_lines(self, max_width):
+        """Return the license text word-wrapped to ``max_width`` pixels.
+
+        Splits ``self.license_text`` on newlines (preserving blank lines) and
+        greedily word-wraps each line so that its rendered width, measured with
+        ``cv2.getTextSize``, does not exceed ``max_width``. A single word wider
+        than ``max_width`` is kept on its own line and left to be clipped by the
+        frame edge during rendering.
+        """
+        wrapped = []
+        for raw_line in self.license_text.split("\n"):
+            if raw_line == "":
+                wrapped.append("")
+                continue
+            current = ""
+            for word in raw_line.split(" "):
+                candidate = word if current == "" else current + " " + word
+                (text_w, _), _ = cv2.getTextSize(
+                    candidate, self._FONT, self._FONT_SCALE, self._FONT_THICKNESS
+                )
+                if text_w <= max_width or current == "":
+                    current = candidate
+                else:
+                    wrapped.append(current)
+                    current = word
+            wrapped.append(current)
+        return wrapped
+
+    def _clamp_scroll(self, line_count, visible_lines):
+        """Clamp ``scroll_offset`` to ``[0, max_scroll_offset]``.
+
+        ``max_scroll_offset`` is the number of wrapped lines that do not fit on
+        screen (``line_count - visible_lines``, floored at 0) and is stored on
+        the instance so :meth:`handle_input` can bound scroll key presses.
+        """
+        self.max_scroll_offset = max(0, line_count - visible_lines)
+        if self.scroll_offset > self.max_scroll_offset:
+            self.scroll_offset = self.max_scroll_offset
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+
+    def render(self, frame):
+        """Render the full-screen license acceptance overlay.
+
+        Fills ``frame`` with a dark background, draws the scrollable license
+        text word-wrapped to the frame width, and shows a "Press Enter to
+        accept" instruction (with scroll/exit hints) in a reserved band at the
+        bottom. ``frame`` is modified in-place.
+        """
+        h, w = frame.shape[:2]
+        frame[:] = self._BG_COLOR
+
+        max_text_width = w - 2 * self._MARGIN_X
+        lines = self._wrap_text_lines(max_text_width)
+
+        usable_height = h - self._TOP_MARGIN - self._BOTTOM_MARGIN
+        visible_lines = max(1, usable_height // self._LINE_HEIGHT)
+        self._clamp_scroll(len(lines), visible_lines)
+
+        start = self.scroll_offset
+        end = start + visible_lines
+        y = self._TOP_MARGIN
+        for line in lines[start:end]:
+            cv2.putText(
+                frame, line, (self._MARGIN_X, y), self._FONT, self._FONT_SCALE,
+                self._TEXT_COLOR, self._FONT_THICKNESS, cv2.LINE_AA,
+            )
+            y += self._LINE_HEIGHT
+
+        # Instruction band at the bottom, drawn over an opaque strip so it
+        # never overlaps scrolled body text.
+        cv2.rectangle(
+            frame, (0, h - self._BOTTOM_MARGIN), (w, h), self._BG_COLOR, -1
+        )
+        instruction = "Press Enter to accept   (Up/Down to scroll, Esc to exit)"
+        (text_w, _), _ = cv2.getTextSize(instruction, self._FONT, 0.5, 1)
+        ix = max(self._MARGIN_X, (w - text_w) // 2)
+        cv2.putText(
+            frame, instruction, (ix, h - 20), self._FONT, 0.5,
+            self._INSTRUCTION_COLOR, 1, cv2.LINE_AA,
+        )
+
+    def render_overlay(self, frame):
+        """Render a read-only license panel over the current game frame.
+
+        Draws a semi-transparent dark panel inset from the frame edges (so the
+        live webcam feed remains faintly visible), lays out the scrollable
+        license text inside it, and shows a "Press any key to dismiss"
+        instruction at the bottom of the panel. Used when the 'A' key is pressed
+        during gameplay. ``frame`` is modified in-place.
+        """
+        h, w = frame.shape[:2]
+        px0, py0 = self._MARGIN_X, self._TOP_MARGIN
+        px1, py1 = w - self._MARGIN_X, h - self._TOP_MARGIN
+
+        # Semi-transparent dark panel over the live frame.
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px0, py0), (px1, py1), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+        inner_margin = 20
+        max_text_width = (px1 - px0) - 2 * inner_margin
+        lines = self._wrap_text_lines(max_text_width)
+
+        usable_height = (py1 - py0) - inner_margin - self._LINE_HEIGHT
+        visible_lines = max(1, usable_height // self._LINE_HEIGHT)
+        self._clamp_scroll(len(lines), visible_lines)
+
+        start = self.scroll_offset
+        end = start + visible_lines
+        y = py0 + inner_margin + 4
+        for line in lines[start:end]:
+            cv2.putText(
+                frame, line, (px0 + inner_margin, y), self._FONT,
+                self._FONT_SCALE, self._TEXT_COLOR, self._FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
+            y += self._LINE_HEIGHT
+
+        instruction = "Press any key to dismiss"
+        (text_w, _), _ = cv2.getTextSize(instruction, self._FONT, 0.5, 1)
+        ix = max(px0, (w - text_w) // 2)
+        cv2.putText(
+            frame, instruction, (ix, py1 - 15), self._FONT, 0.5,
+            self._INSTRUCTION_COLOR, 1, cv2.LINE_AA,
+        )
+
+    def handle_input(self, key):
+        """Handle a key press on the license screen.
+
+        Returns ``'accept'`` for Enter (key code 13, also recording acceptance),
+        ``'exit'`` for Escape (key code 27), and ``'none'`` otherwise. Up/Down
+        arrow keys (and 'w'/'s') scroll the text, updating ``scroll_offset``
+        clamped to ``[0, max_scroll_offset]``; scroll keys still return
+        ``'none'`` since they neither accept nor exit.
+        """
+        if key == 13:  # Enter
+            self.accepted = True
+            return "accept"
+        if key == 27:  # Escape
+            return "exit"
+
+        # Scroll up: Up arrow (waitKey 82 / waitKeyEx 2490368) or 'w'.
+        if key in (82, 2490368, ord("w"), ord("W")):
+            self.scroll_offset = max(0, self.scroll_offset - self._SCROLL_STEP)
+        # Scroll down: Down arrow (waitKey 84 / waitKeyEx 2621440) or 's'.
+        elif key in (84, 2621440, ord("s"), ord("S")):
+            self.scroll_offset = min(
+                self.max_scroll_offset, self.scroll_offset + self._SCROLL_STEP
+            )
+        return "none"
+
+
+# ---------------------------------------------------------------------------
+# TutorialSystem (guided 3-ball first-launch tutorial)
+# ---------------------------------------------------------------------------
+# Runs a short guided sequence the first time the game is launched: a single
+# ball descends, pauses under a circular spotlight with an explanatory caption,
+# then resumes so the player can try to hit it, followed by two more free
+# practice balls and a final "ready to start" prompt. Completion is persisted
+# to a ``.tutorial_done`` marker file so the tutorial is skipped on subsequent
+# launches. All ball coordinates are in the 1440x1024 reference space; the
+# spotlight/instruction rendering operates on screen-space BGR frames.
+
+
+class TutorialPhase(Enum):
+    """The phases of the guided tutorial sequence.
+
+    ``BALL_DESCENDING`` -> ``SPOTLIGHT_PAUSE`` -> ``BALL_RESUMED`` ->
+    ``PRACTICE_BALLS`` -> ``COMPLETE``. The first ball drives the descend →
+    spotlight → resume steps; the two follow-up practice balls run in
+    ``PRACTICE_BALLS``; ``COMPLETE`` shows the start prompt and waits for Enter.
+    """
+
+    BALL_DESCENDING = "ball_descending"
+    SPOTLIGHT_PAUSE = "spotlight_pause"
+    BALL_RESUMED = "ball_resumed"
+    PRACTICE_BALLS = "practice_balls"
+    COMPLETE = "complete"
+
+
+class TutorialSystem:
+    """Manage the guided 3-ball tutorial sequence.
+
+    The system owns a single active ``tutorial_ball`` at a time and advances a
+    small phase machine via :meth:`update`. The caller drives it each frame with
+    the frame delta-time and the latest key code, and renders the spotlight and
+    instruction text via :meth:`render_spotlight` and
+    :meth:`render_instructions`. A ball counts as resolved when it is hit (the
+    caller sets ``tutorial_ball`` to ``None``) or when it falls past the table
+    bottom.
+    """
+
+    TUTORIAL_DONE_FILE = ".tutorial_done"
+    SPOTLIGHT_THRESHOLD = 0.4  # fraction of frame height at which the ball pauses
+
+    # Default tutorial ball speed (reference px/s) and geometry.
+    TUTORIAL_BALL_SPEED = 400
+    TUTORIAL_TABLE_TOP_Y = TABLE_TOP_LEFT[1]  # 292 (table top edge)
+    TUTORIAL_TABLE_X_CENTER = (TABLE_TOP_LEFT[0] + TABLE_TOP_RIGHT[0]) / 2.0  # 719.5
+
+    # Maximum delta-time applied to ball physics (matches project convention).
+    MAX_DT = 0.1
+
+    # Total number of tutorial balls (1 guided + 2 practice).
+    PRACTICE_BALL_COUNT = 2
+
+    # Instruction captions shown during the sequence.
+    SPOTLIGHT_MESSAGE = "This is the ball you need to hit"
+    COMPLETE_MESSAGE = "Ready to start? Press Enter to begin"
+
+    # Spotlight radius (screen pixels) used by the default caller.
+    SPOTLIGHT_RADIUS = 140
+
+    # render_instructions text styling (OpenCV putText parameters).
+    _FONT = cv2.FONT_HERSHEY_SIMPLEX
+    _FONT_SCALE = 0.9
+    _FONT_THICKNESS = 2
+    _TEXT_COLOR = (255, 255, 255)   # BGR white body text
+    _OUTLINE_COLOR = (0, 0, 0)      # BGR black outline for contrast
+    _OUTLINE_THICKNESS = 5
+
+    def __init__(self):
+        self.phase = TutorialPhase.BALL_DESCENDING
+        self.tutorial_ball = self.spawn_tutorial_ball(
+            self.TUTORIAL_TABLE_TOP_Y,
+            self.TUTORIAL_TABLE_X_CENTER,
+            self.TUTORIAL_BALL_SPEED,
+        )
+        # Practice balls still to spawn/resolve after the guided ball.
+        self.practice_balls_remaining = self.PRACTICE_BALL_COUNT
+        # Total balls resolved so far (hit or missed).
+        self.balls_resolved = 0
+
+    @staticmethod
+    def is_tutorial_done():
+        """Return True if the ``.tutorial_done`` marker file exists."""
+        return os.path.exists(TutorialSystem.TUTORIAL_DONE_FILE)
+
+    @staticmethod
+    def mark_tutorial_done():
+        """Create the ``.tutorial_done`` marker file to persist completion.
+
+        Failure to write the marker is non-critical (the tutorial simply repeats
+        on the next launch), so any ``OSError`` is swallowed silently rather than
+        interrupting the game.
+        """
+        try:
+            with open(TutorialSystem.TUTORIAL_DONE_FILE, "w", encoding="utf-8") as handle:
+                handle.write("")
+        except OSError:
+            # Non-critical: tutorial will simply repeat next launch.
+            pass
+
+    def spawn_tutorial_ball(self, table_top_y, table_x_center, speed):
+        """Return a :class:`FallingBall` spawned at the center of the table top.
+
+        The ball is placed at ``table_x_center`` horizontally and ``table_top_y``
+        vertically (the top edge of the table trapezoid) so it descends straight
+        down the middle of the table for the tutorial.
+        """
+        return FallingBall(
+            x=float(table_x_center),
+            y=float(table_top_y),
+            speed=speed,
+            ball_type="white",
+        )
+
+    def _ball_resolved(self):
+        """Return True if the current tutorial ball has been resolved.
+
+        A ball is resolved when the caller has cleared it after a hit
+        (``tutorial_ball is None``) or when it has fallen past the table bottom.
+        """
+        return self.tutorial_ball is None or self.tutorial_ball.is_past_table_bottom()
+
+    def update(self, dt, key):
+        """Advance the tutorial phase machine one frame.
+
+        ``dt`` is the frame delta-time in seconds (clamped internally to
+        :attr:`MAX_DT` before it drives ball physics) and ``key`` is the latest
+        key code (or -1 when no key was pressed). Returns an action string:
+
+        - ``'continue'`` while a phase is still in progress,
+        - ``'advance'`` when the spotlight pause is dismissed with Enter,
+        - ``'complete'`` when the player presses Enter at the completion prompt,
+        - ``None`` if the phase machine is in an unrecognized state.
+
+        Phase flow: the ball descends until it reaches
+        :attr:`SPOTLIGHT_THRESHOLD` of the frame height, pauses under the
+        spotlight until Enter, resumes and is resolved, then two practice balls
+        are spawned and resolved before the completion prompt.
+        """
+        dt = min(dt, self.MAX_DT)
+
+        if self.phase == TutorialPhase.BALL_DESCENDING:
+            self.tutorial_ball.update(dt)
+            threshold_y = self.SPOTLIGHT_THRESHOLD * CoordinateTransform.REF_HEIGHT
+            if self.tutorial_ball.y >= threshold_y:
+                self.phase = TutorialPhase.SPOTLIGHT_PAUSE
+            return "continue"
+
+        if self.phase == TutorialPhase.SPOTLIGHT_PAUSE:
+            # Ball movement is frozen; wait for Enter to resume.
+            if key == 13:
+                self.phase = TutorialPhase.BALL_RESUMED
+                return "advance"
+            return "continue"
+
+        if self.phase == TutorialPhase.BALL_RESUMED:
+            if self.tutorial_ball is not None:
+                self.tutorial_ball.update(dt)
+            if self._ball_resolved():
+                self.balls_resolved += 1
+                self._start_next_practice_ball()
+            return "continue"
+
+        if self.phase == TutorialPhase.PRACTICE_BALLS:
+            if self.tutorial_ball is not None:
+                self.tutorial_ball.update(dt)
+            if self._ball_resolved():
+                self.balls_resolved += 1
+                self.practice_balls_remaining -= 1
+                if self.practice_balls_remaining > 0:
+                    self.tutorial_ball = self.spawn_tutorial_ball(
+                        self.TUTORIAL_TABLE_TOP_Y,
+                        self.TUTORIAL_TABLE_X_CENTER,
+                        self.TUTORIAL_BALL_SPEED,
+                    )
+                else:
+                    self.tutorial_ball = None
+                    self.phase = TutorialPhase.COMPLETE
+            return "continue"
+
+        if self.phase == TutorialPhase.COMPLETE:
+            if key == 13:
+                self.mark_tutorial_done()
+                return "complete"
+            return "continue"
+
+        return None
+
+    def _start_next_practice_ball(self):
+        """Transition into the practice-ball phase and spawn the first one.
+
+        Called once the guided (first) ball is resolved. If no practice balls
+        are configured, jumps straight to the completion prompt instead.
+        """
+        if self.practice_balls_remaining > 0:
+            self.phase = TutorialPhase.PRACTICE_BALLS
+            self.tutorial_ball = self.spawn_tutorial_ball(
+                self.TUTORIAL_TABLE_TOP_Y,
+                self.TUTORIAL_TABLE_X_CENTER,
+                self.TUTORIAL_BALL_SPEED,
+            )
+        else:
+            self.tutorial_ball = None
+            self.phase = TutorialPhase.COMPLETE
+
+    def render_spotlight(self, frame, ball_center, radius):
+        """Dim the frame everywhere outside a circular spotlight.
+
+        Pixels outside the circle centered on ``ball_center`` (screen pixel
+        coordinates) with the given ``radius`` are darkened to 30% brightness
+        (a 70% dim), leaving the ball highlighted. ``frame`` is modified
+        in-place. A binary mask marks the spotlight interior so only the outside
+        region is replaced with the darkened copy.
+        """
+        dark = (frame * 0.3).astype(np.uint8)
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.circle(mask, (int(ball_center[0]), int(ball_center[1])), int(radius), 255, -1)
+        frame[mask == 0] = dark[mask == 0]
+
+    def render_instructions(self, frame, text, position):
+        """Draw tutorial instruction ``text`` at ``position`` on ``frame``.
+
+        Renders the text with a black outline beneath white glyphs so it stays
+        legible over both the darkened spotlight background and the live webcam
+        feed. ``position`` is the ``(x, y)`` bottom-left baseline of the text in
+        screen pixels. ``frame`` is modified in-place.
+        """
+        cv2.putText(
+            frame, text, position, self._FONT, self._FONT_SCALE,
+            self._OUTLINE_COLOR, self._OUTLINE_THICKNESS, cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame, text, position, self._FONT, self._FONT_SCALE,
+            self._TEXT_COLOR, self._FONT_THICKNESS, cv2.LINE_AA,
+        )
