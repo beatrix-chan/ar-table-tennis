@@ -1419,7 +1419,7 @@ def tick_state_machine(ctx, dt, landmarks, key, current_time):
     if state == GameState.LICENSE:
         return _tick_license(ctx, key)
     if state == GameState.TUTORIAL:
-        return _tick_tutorial(ctx, dt, key)
+        return _tick_tutorial(ctx, dt, landmarks, key)
     if state == GameState.WAIT_COUNTDOWN:
         return _tick_wait_countdown(ctx, key, current_time)
     if state == GameState.BALL_FALLING:
@@ -1450,8 +1450,13 @@ def _tick_license(ctx, key):
     return None
 
 
-def _tick_tutorial(ctx, dt, key):
+def _tick_tutorial(ctx, dt, landmarks, key):
     """Handle the guided TUTORIAL state.
+
+    Before advancing the sequence, an active swing is evaluated against the
+    live tutorial ball via :func:`_maybe_hit_tutorial_ball` so the player can
+    interactively knock it out (Requirements 2.4/2.5); a registered hit clears
+    the ball, which :meth:`TutorialSystem.update` then treats as resolved.
 
     Delegates to :meth:`TutorialSystem.update`, which advances the ball
     descend -> spotlight -> resume -> practice sequence, consumes Enter to
@@ -1466,11 +1471,52 @@ def _tick_tutorial(ctx, dt, key):
         ctx.state = GameState.WAIT_COUNTDOWN
         return None
 
+    _maybe_hit_tutorial_ball(ctx, landmarks)
     action = ctx.tutorial_system.update(dt, key)
     if action == "complete":
         ctx.tutorial_done = True
         ctx.state = GameState.WAIT_COUNTDOWN
     return None
+
+
+def _maybe_hit_tutorial_ball(ctx, landmarks):
+    """Resolve the tutorial ball early when the player swings and hits it.
+
+    Only active while the tutorial ball is live and the sequence is in a phase
+    where the player is meant to attempt a hit (``BALL_RESUMED`` or
+    ``PRACTICE_BALLS``). Mirrors the gameplay swing pipeline: it needs a tracked
+    hand and a computable velocity, classifies the motion as a swing
+    (:func:`classify_swing`), and then tests the swing against the single
+    tutorial ball with the same collision radius used in-game
+    (:func:`evaluate_hit`). Unlike :func:`evaluate_all_balls` it does not gate on
+    the Player_Zone, so the guided ball can be struck anywhere along its descent.
+    On a hit the tutorial ball is cleared (set to ``None``); the next
+    :meth:`TutorialSystem.update` sees it resolved and advances the sequence.
+    """
+    tutorial = ctx.tutorial_system
+    if tutorial is None or tutorial.tutorial_ball is None:
+        return
+    if tutorial.phase not in (
+        TutorialPhase.BALL_RESUMED, TutorialPhase.PRACTICE_BALLS
+    ):
+        return
+    if landmarks is None or ctx.velocity_buffer is None:
+        return
+
+    vel_result = ctx.velocity_buffer.compute_velocity()
+    if vel_result is None:
+        return
+    vx, vy, magnitude = vel_result
+    if not classify_swing(magnitude, compute_palm_normal(landmarks)):
+        return
+
+    palm_center = compute_palm_center(
+        landmarks, CoordinateTransform.REF_WIDTH, CoordinateTransform.REF_HEIGHT
+    )
+    ball_radius = (BALL_SIZE_RATIO * CoordinateTransform.REF_WIDTH) / 2
+    collision_radius = ball_radius + 30
+    if evaluate_hit(palm_center, (vx, vy), tutorial.tutorial_ball, collision_radius):
+        tutorial.tutorial_ball = None
 
 
 def _tick_wait_countdown(ctx, key, current_time):
@@ -1653,3 +1699,699 @@ def _tick_game_over(ctx, key):
     if key != KEY_NONE:
         return "exit"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Rendering pipeline (SVG layer compositing)
+# ---------------------------------------------------------------------------
+# Module-level functions that composite the SVG graphic layers onto the live
+# webcam frame each iteration. The main loop supplies a BGR ``frame`` that has
+# already been mirrored (``cv2.flip``) and resized to the window dimensions;
+# these helpers then paint, back to front, the table/net overlay (layer 1), the
+# racket at the palm center (layer 2), and every falling ball (layer 3). UI
+# text and visual effects (layers 4+) are drawn by the task 8.2 renderers.
+#
+# All ball and palm positions are expressed in the 1440x1024 reference space
+# and mapped to screen pixels via the shared :class:`CoordinateTransform`, so a
+# ball at reference ``(x, y)`` lands under the same table cell regardless of the
+# actual window size. Asset sizes are derived from the reference table width
+# (:data:`RACKET_SIZE_RATIO` / :data:`BALL_SIZE_RATIO`) and then scaled to
+# screen, keeping the racket at 15% and each ball at 8% of the table width with
+# the racket's native 250:368 aspect preserved.
+
+
+def render_table_layer(frame, svg_loader):
+    """Composite the ``table-net.svg`` overlay across the whole frame.
+
+    ``frame`` is the window-sized BGR background (mirrored webcam feed). The
+    table asset is authored at the 1440x1024 reference resolution; if the window
+    (and therefore ``frame``) differs from that, the asset is resized to the
+    frame's ``(width, height)`` before the full-frame alpha blend so
+    :meth:`LayerCompositor.composite_full_frame` receives an overlay matching
+    the background dimensions. ``frame`` is modified in-place.
+    """
+    table = svg_loader.table_net
+    h, w = frame.shape[:2]
+    if table.shape[0] != h or table.shape[1] != w:
+        table = cv2.resize(table, (w, h), interpolation=cv2.INTER_AREA)
+    LayerCompositor.composite_full_frame(frame, table)
+
+
+def render_racket_layer(frame, svg_loader, palm_center, coord_transform):
+    """Draw the racket SVG centered on the palm, or nothing if no hand.
+
+    ``palm_center`` is the tracked hand's ``(x, y)`` position in reference
+    coordinates, or ``None`` when no hand is detected this frame -- in which case
+    the racket is hidden (Requirement 5.5) and the frame is left untouched. The
+    racket defaults to ``racket-red.svg``. Its screen width is 15% of the table
+    width (:data:`RACKET_SIZE_RATIO` of the reference width, scaled to screen)
+    and its height preserves the native 250:368 aspect via
+    :data:`RACKET_ASPECT`. The asset is centered on the palm by offsetting the
+    top-left position by half the scaled width/height. ``frame`` is modified
+    in-place.
+    """
+    if palm_center is None:
+        return
+
+    racket_w = coord_transform.scale_length(
+        RACKET_SIZE_RATIO * CoordinateTransform.REF_WIDTH
+    )
+    racket_h = int(racket_w / RACKET_ASPECT)
+    if racket_w <= 0 or racket_h <= 0:
+        return
+
+    sx, sy = coord_transform.ref_to_screen(palm_center[0], palm_center[1])
+    top_left = (sx - racket_w // 2, sy - racket_h // 2)
+    LayerCompositor.alpha_blend(
+        frame, svg_loader.racket_red, top_left, size=(racket_w, racket_h)
+    )
+
+
+def render_balls_layer(frame, balls, svg_loader, coord_transform):
+    """Draw every active falling ball centered on its reference position.
+
+    Each ball in ``balls`` is rendered with the white or orange SVG chosen by
+    its ``ball_type`` (via :meth:`SVGLoader.get_ball_svg`), scaled so its
+    diameter equals 8% of the table width (:data:`BALL_SIZE_RATIO` of the
+    reference width, scaled to screen). The ball's reference ``(x, y)`` center is
+    mapped to screen space and the square asset is offset by half its scaled size
+    so it is centered on that point. ``frame`` is modified in-place.
+    """
+    diameter = coord_transform.scale_length(
+        BALL_SIZE_RATIO * CoordinateTransform.REF_WIDTH
+    )
+    if diameter <= 0:
+        return
+
+    for ball in balls:
+        ball_svg = svg_loader.get_ball_svg(ball.ball_type)
+        sx, sy = coord_transform.ref_to_screen(ball.x, ball.y)
+        top_left = (sx - diameter // 2, sy - diameter // 2)
+        LayerCompositor.alpha_blend(
+            frame, ball_svg, top_left, size=(diameter, diameter)
+        )
+
+
+def render_svg_layers(ctx, frame, svg_loader, palm_center=None):
+    """Composite the table, racket, and ball SVG layers onto ``frame``.
+
+    Orchestrates the back-to-front SVG rendering for a single frame using the
+    context's :class:`CoordinateTransform` (``ctx.coord_transform``) and active
+    balls (``ctx.balls``):
+
+    1. ``table-net.svg`` composited full-frame (:func:`render_table_layer`),
+    2. the racket at ``palm_center`` scaled to 15% of the table width
+       (:func:`render_racket_layer`) -- hidden when ``palm_center`` is ``None``,
+    3. each falling ball scaled to 8% of the table width
+       (:func:`render_balls_layer`).
+
+    ``frame`` is the window-sized mirrored webcam background and is modified
+    in-place. ``palm_center`` is the reference-space palm position or ``None``.
+    UI text overlays and visual effects (layers 4+) are applied afterward by the
+    task 8.2 renderers. Returns ``None``.
+    """
+    render_table_layer(frame, svg_loader)
+    render_racket_layer(frame, svg_loader, palm_center, ctx.coord_transform)
+    render_balls_layer(frame, ctx.balls, svg_loader, ctx.coord_transform)
+
+
+# ---------------------------------------------------------------------------
+# UI text overlays and visual effects (rendering layers 4-5)
+# ---------------------------------------------------------------------------
+# Module-level functions that paint the heads-up display and short-lived visual
+# effects on top of the composited SVG layers each frame. They draw directly on
+# the window-sized BGR ``frame`` with OpenCV primitives and modify it in-place.
+# The score sits in the top-left corner and the timer is right-aligned in the
+# top-right corner; countdown, pause, game-over, and speed-selection captions
+# are centered; flash overlays tint the whole frame; and the trajectory preview
+# draws a short line from the racket in the direction of a fast swing.
+#
+# ``render_flash`` follows the design's convention of a full-frame 30% opacity
+# tint. The caller (main loop / RESULT + miss handling) owns the flash timing by
+# comparing ``ctx.flash_effect``'s expire timestamp against the current clock
+# and only calls this with the color name while the effect is still active.
+
+# Font used for every HUD/overlay caption (matches the rest of the UI).
+_UI_FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# HUD text styling for the persistent score/timer readouts.
+_HUD_FONT_SCALE = 0.8
+_HUD_THICKNESS = 2
+_HUD_TEXT_COLOR = (255, 255, 255)   # BGR white
+_HUD_OUTLINE_COLOR = (0, 0, 0)      # BGR black outline for contrast
+_HUD_OUTLINE_THICKNESS = 4
+_HUD_MARGIN = 10                    # top/side margin (px)
+
+# Flash overlay opacity and color map (name -> BGR). Green marks a scored hit,
+# yellow a hit that did not score, red a missed ball.
+FLASH_OPACITY = 0.3
+FLASH_COLOR_BGR = {
+    "green": (0, 255, 0),
+    "yellow": (0, 255, 255),
+    "red": (0, 0, 255),
+}
+
+# Reference length (px) of the swing trajectory preview line, scaled to screen.
+TRAJECTORY_REF_LENGTH = 100
+# Minimum swing speed (px/s) required before the trajectory preview is drawn.
+TRAJECTORY_MIN_SPEED = 200.0
+_TRAJECTORY_COLOR = (0, 255, 255)   # BGR yellow
+_TRAJECTORY_THICKNESS = 3
+
+
+def _draw_outlined_text(frame, text, position, font_scale, text_color,
+                        thickness, outline_thickness=None):
+    """Draw ``text`` with a black outline beneath colored glyphs.
+
+    Renders the caption twice at ``position`` (the ``(x, y)`` baseline in screen
+    pixels): first a thick black outline pass, then the colored fill pass, so
+    the text stays legible over the busy webcam/SVG background. ``frame`` is
+    modified in-place.
+    """
+    if outline_thickness is None:
+        outline_thickness = thickness + 3
+    cv2.putText(
+        frame, text, position, _UI_FONT, font_scale, _HUD_OUTLINE_COLOR,
+        outline_thickness, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, text, position, _UI_FONT, font_scale, text_color, thickness,
+        cv2.LINE_AA,
+    )
+
+
+def render_score(frame, score):
+    """Draw the "Score: N" readout in the top-left corner.
+
+    The caption is drawn at ``(10, 30)`` (Requirement 8.1) with a black outline
+    for contrast over the live feed. ``frame`` is modified in-place.
+    """
+    text = "Score: {}".format(int(score))
+    _draw_outlined_text(
+        frame, text, (_HUD_MARGIN, 30), _HUD_FONT_SCALE, _HUD_TEXT_COLOR,
+        _HUD_THICKNESS, _HUD_OUTLINE_THICKNESS,
+    )
+
+
+def render_timer(frame, remaining, frame_width):
+    """Draw the remaining-time readout, right-aligned in the top-right corner.
+
+    ``remaining`` is the time left in seconds (any int/float); it is shown as an
+    integer count of whole seconds as "Time: Ns". The x position is computed
+    from the measured text width and ``frame_width`` so the caption's right edge
+    sits ``_HUD_MARGIN`` pixels from the right frame edge (Requirement 8.2).
+    ``frame`` is modified in-place.
+    """
+    seconds = max(0, int(remaining))
+    text = "Time: {}s".format(seconds)
+    (text_w, _), _ = cv2.getTextSize(
+        text, _UI_FONT, _HUD_FONT_SCALE, _HUD_THICKNESS
+    )
+    x = frame_width - text_w - _HUD_MARGIN
+    _draw_outlined_text(
+        frame, text, (x, 30), _HUD_FONT_SCALE, _HUD_TEXT_COLOR,
+        _HUD_THICKNESS, _HUD_OUTLINE_THICKNESS,
+    )
+
+
+def render_countdown(frame, number, w, h):
+    """Draw the pre-round countdown ``number`` (3, 2, 1) large and centered.
+
+    The digit is rendered at a large font scale centered on the frame using the
+    measured text size so it is horizontally and vertically centered on
+    ``(w, h)`` (Requirement 8.2 / 13.1). ``frame`` is modified in-place.
+    """
+    text = str(int(number))
+    font_scale = 6.0
+    thickness = 8
+    (text_w, text_h), _ = cv2.getTextSize(text, _UI_FONT, font_scale, thickness)
+    x = (w - text_w) // 2
+    y = (h + text_h) // 2
+    _draw_outlined_text(
+        frame, text, (x, y), font_scale, _HUD_TEXT_COLOR, thickness,
+        thickness + 6,
+    )
+
+
+def render_pause_indicator(frame, w, h):
+    """Draw the "PAUSED" caption centered on the frame.
+
+    Shown while ``ctx.paused`` is set during an active round (Requirement 14.4).
+    The caption is centered on ``(w, h)`` using the measured text size. ``frame``
+    is modified in-place.
+    """
+    text = "PAUSED"
+    font_scale = 2.0
+    thickness = 4
+    (text_w, text_h), _ = cv2.getTextSize(text, _UI_FONT, font_scale, thickness)
+    x = (w - text_w) // 2
+    y = (h + text_h) // 2
+    _draw_outlined_text(
+        frame, text, (x, y), font_scale, _HUD_TEXT_COLOR, thickness,
+        thickness + 4,
+    )
+
+
+def render_game_over(frame, score, w, h):
+    """Draw the "Game Over" caption plus the final score, centered on the frame.
+
+    Renders "Game Over" above the final "Score: N" line, both horizontally
+    centered on ``(w, h)`` with the two lines stacked around the vertical center
+    (Requirement 13.5). ``frame`` is modified in-place.
+    """
+    title = "Game Over"
+    title_scale = 2.5
+    title_thickness = 5
+    (title_w, title_h), _ = cv2.getTextSize(
+        title, _UI_FONT, title_scale, title_thickness
+    )
+    title_x = (w - title_w) // 2
+    title_y = h // 2 - 20
+    _draw_outlined_text(
+        frame, title, (title_x, title_y), title_scale, _HUD_TEXT_COLOR,
+        title_thickness, title_thickness + 4,
+    )
+
+    score_text = "Score: {}".format(int(score))
+    score_scale = 1.5
+    score_thickness = 3
+    (score_w, score_h), _ = cv2.getTextSize(
+        score_text, _UI_FONT, score_scale, score_thickness
+    )
+    score_x = (w - score_w) // 2
+    score_y = title_y + title_h + 40
+    _draw_outlined_text(
+        frame, score_text, (score_x, score_y), score_scale, _HUD_TEXT_COLOR,
+        score_thickness, score_thickness + 4,
+    )
+
+
+def render_flash(frame, color):
+    """Apply a full-frame semi-transparent color tint.
+
+    ``color`` is one of ``"green"`` (scored hit), ``"yellow"`` (hit but no
+    score), or ``"red"`` (miss); it is mapped to a BGR tint via
+    :data:`FLASH_COLOR_BGR` and blended over the whole frame at
+    :data:`FLASH_OPACITY` (30%) using ``cv2.addWeighted``. The caller decides
+    whether the flash is still active by comparing the effect's expire timestamp
+    against the current clock; this function simply paints the given color.
+    Unknown color names are ignored. ``frame`` is modified in-place.
+    """
+    bgr = FLASH_COLOR_BGR.get(color)
+    if bgr is None:
+        return
+    overlay = frame.copy()
+    overlay[:] = bgr
+    cv2.addWeighted(
+        overlay, FLASH_OPACITY, frame, 1 - FLASH_OPACITY, 0, frame
+    )
+
+
+def render_trajectory(frame, palm_center, velocity, coord_transform):
+    """Draw a short swing-direction preview line from the racket center.
+
+    Drawn only when the swing speed exceeds :data:`TRAJECTORY_MIN_SPEED`
+    (200 px/s), giving the player a preview of the direction they are swinging
+    (Requirement 16.5). ``palm_center`` is the racket/palm position in reference
+    coordinates and ``velocity`` is a ``(vx, vy)`` or ``(vx, vy, magnitude)``
+    tuple. The velocity direction is normalized and drawn as a line of
+    :data:`TRAJECTORY_REF_LENGTH` reference pixels, scaled to screen via
+    ``coord_transform.scale_length``, starting at the palm center mapped through
+    ``coord_transform.ref_to_screen``. Nothing is drawn if ``palm_center`` is
+    ``None`` or the speed is at/below the threshold. ``frame`` is modified
+    in-place.
+    """
+    if palm_center is None:
+        return
+
+    vx, vy = float(velocity[0]), float(velocity[1])
+    speed = float(np.sqrt(vx * vx + vy * vy))
+    if speed <= TRAJECTORY_MIN_SPEED:
+        return
+
+    # Unit direction of the swing.
+    dir_x = vx / speed
+    dir_y = vy / speed
+
+    start = coord_transform.ref_to_screen(palm_center[0], palm_center[1])
+    length = coord_transform.scale_length(TRAJECTORY_REF_LENGTH)
+    end = (
+        int(start[0] + dir_x * length),
+        int(start[1] + dir_y * length),
+    )
+    cv2.line(frame, start, end, _TRAJECTORY_COLOR, _TRAJECTORY_THICKNESS,
+             cv2.LINE_AA)
+
+
+def render_speed_selection(frame, speed_value):
+    """Draw the ball-speed readout and the "Press Enter to start" prompt.
+
+    Shown during WAIT_COUNTDOWN before the countdown begins (Requirement 8.5 /
+    13.2). Renders the current selected fall speed and a prompt to begin the
+    round, centered horizontally near the vertical center of the frame.
+    ``frame`` is modified in-place.
+    """
+    h, w = frame.shape[:2]
+
+    speed_text = "Ball Speed: {}".format(int(speed_value))
+    speed_scale = 1.2
+    speed_thickness = 3
+    (speed_w, speed_h), _ = cv2.getTextSize(
+        speed_text, _UI_FONT, speed_scale, speed_thickness
+    )
+    speed_x = (w - speed_w) // 2
+    speed_y = h // 2 - 20
+    _draw_outlined_text(
+        frame, speed_text, (speed_x, speed_y), speed_scale, _HUD_TEXT_COLOR,
+        speed_thickness, speed_thickness + 4,
+    )
+
+    prompt = "Press Enter to start"
+    prompt_scale = 0.9
+    prompt_thickness = 2
+    (prompt_w, prompt_h), _ = cv2.getTextSize(
+        prompt, _UI_FONT, prompt_scale, prompt_thickness
+    )
+    prompt_x = (w - prompt_w) // 2
+    prompt_y = speed_y + speed_h + 30
+    _draw_outlined_text(
+        frame, prompt, (prompt_x, prompt_y), prompt_scale, _HUD_TEXT_COLOR,
+        prompt_thickness, prompt_thickness + 3,
+    )
+
+# ---------------------------------------------------------------------------
+# Main game loop (application entry point)
+# ---------------------------------------------------------------------------
+# ``main`` wires the individual subsystems together and runs the game. This
+# task (10.1) implements the initialization/setup portion only: it opens the
+# webcam, creates the display window and speed trackbar, loads the SVG assets,
+# creates the MediaPipe hand landmarker, builds the coordinate transform, loads
+# the license screen, and seeds a :class:`GameContext` in the LICENSE state
+# (skipping the tutorial when it has already been completed). The per-frame
+# capture -> flip -> detect -> tick -> composite -> display pipeline, the input
+# dispatch, and resource cleanup are implemented in tasks 10.2, 10.3, and 10.4.
+#
+# Startup errors follow the design's error-handling table: a missing model,
+# missing SVG asset, or missing LICENSE file all raise ``SystemExit`` from their
+# respective loaders (which prints the message and exits with a non-zero code),
+# and a webcam that fails to open is handled explicitly here the same way.
+
+# Window and capture configuration. The window keeps the 1440:1024 reference
+# aspect ratio (1080x768 == 1440:1024) so the fit-to-contain transform produces
+# no letterboxing at the default size. Tasks 10.2-10.4 read WINDOW_NAME and
+# TRACKBAR_SPEED_NAME to display frames, poll the speed trackbar, and clean up.
+WINDOW_NAME = "AR Table Tennis"
+WINDOW_WIDTH = 1080   # 1440 * 0.75
+WINDOW_HEIGHT = 768   # 1024 * 0.75 -> preserves the 1440:1024 aspect ratio
+
+# Speed trackbar configuration (Requirement 7.1/7.2): range 300-800 px/s,
+# default 400. OpenCV trackbars start at 0, so the minimum is raised to
+# SPEED_MIN via cv2.setTrackbarMin after creation.
+TRACKBAR_SPEED_NAME = "Ball Speed"
+SPEED_MIN = 300
+SPEED_MAX = 800
+SPEED_DEFAULT = 400
+
+# Webcam capture configuration (Requirement 3.8): camera index 0 at 1280x720.
+CAMERA_INDEX = 0
+CAPTURE_WIDTH = 1280
+CAPTURE_HEIGHT = 720
+
+# Asset and model locations, relative to the project root.
+ASSETS_DIR = "assets"
+MODEL_PATH = "hand_landmarker.task"
+
+
+def main():
+    """Initialize subsystems and run the AR Table Tennis game.
+
+    Performs the full startup sequence (task 10.1):
+
+    1. Load the SVG assets (:class:`SVGLoader`) and the GPLv3
+       :class:`LicenseScreen`; both raise ``SystemExit`` if a required file is
+       missing.
+    2. Create the MediaPipe hand landmarker via :func:`create_hand_landmarker`
+       (raises ``SystemExit`` if ``hand_landmarker.task`` is missing).
+    3. Open the webcam at camera index 0 and request 1280x720; if it fails to
+       open, print an error and exit with a non-zero code.
+    4. Create the display window and the ball-speed trackbar (300-800, default
+       400).
+    5. Build the :class:`CoordinateTransform` for the window size and seed a
+       :class:`GameContext` in the LICENSE state with a :class:`VelocityBuffer`,
+       skipping the tutorial when ``.tutorial_done`` already exists.
+
+    The frame-processing loop and input dispatch are added by task 10.2, and
+    swing detection/scoring by task 10.4. Task 10.3 wraps the loop in a
+    ``try``/``finally`` so resource cleanup (landmarker close, webcam release,
+    OpenCV window teardown -- in that order, each guarded) runs on every exit
+    path: a normal ``break`` (Escape from any state or any key at GAME_OVER), an
+    exception raised mid-loop, or a KeyboardInterrupt. Input handling itself is
+    routed entirely through :func:`tick_state_machine` (Escape-to-exit, Enter
+    context actions, Spacebar pause, and the 'A' license overlay), so the loop
+    only feeds it inputs and never duplicates that logic.
+    """
+    # (1) Load SVG assets and the license text up front. Each loader raises
+    # SystemExit (printing an identifying message and exiting non-zero) if a
+    # required file is missing, satisfying the "missing SVG" and "missing
+    # LICENSE" startup-error requirements.
+    svg_loader = SVGLoader(ASSETS_DIR)
+    svg_loader.load_all()
+    license_screen = LicenseScreen()
+
+    # (2) Create the MediaPipe hand landmarker. Missing model file -> SystemExit
+    # (exit 1) via create_hand_landmarker.
+    landmarker = create_hand_landmarker(MODEL_PATH)
+
+    # (3) Open the webcam at camera index 0 and request 1280x720. If it cannot
+    # be opened, release the already-created landmarker, print an error, and
+    # exit with a non-zero code (Requirement 3.5).
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+    if not cap.isOpened():
+        cap.release()
+        landmarker.close()
+        raise SystemExit(
+            "Error: could not open webcam at camera index {}. Connect a camera "
+            "and try again.".format(CAMERA_INDEX)
+        )
+
+    # (4) Create the display window (resizable, 1440:1024 aspect) and the ball
+    # speed trackbar. The trackbar is created with a 0..SPEED_MAX range then has
+    # its minimum raised to SPEED_MIN so it represents 300-800 px/s with a
+    # default of 400.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
+    cv2.createTrackbar(
+        TRACKBAR_SPEED_NAME, WINDOW_NAME, SPEED_DEFAULT, SPEED_MAX,
+        lambda value: None,
+    )
+    cv2.setTrackbarMin(TRACKBAR_SPEED_NAME, WINDOW_NAME, SPEED_MIN)
+
+    # (5) Build the coordinate transform for the window size and seed the game
+    # context in the LICENSE state with a warm velocity buffer.
+    ctx = GameContext(state=GameState.LICENSE, ball_speed=SPEED_DEFAULT)
+    ctx.velocity_buffer = VelocityBuffer()
+    ctx.coord_transform = CoordinateTransform(WINDOW_WIDTH, WINDOW_HEIGHT)
+
+    # Tutorial skip logic: on the first launch (no ``.tutorial_done`` marker)
+    # create a TutorialSystem so the LICENSE -> TUTORIAL transition has a ready
+    # instance to drive; on subsequent launches mark the tutorial done so
+    # LICENSE transitions straight to WAIT_COUNTDOWN.
+    if TutorialSystem.is_tutorial_done():
+        ctx.tutorial_done = True
+    else:
+        ctx.tutorial_system = TutorialSystem()
+
+    # --- frame processing loop (task 10.2) ---
+    # Per-frame pipeline: capture -> mirror -> resize -> detect hand -> tick the
+    # state machine -> composite the SVG/HUD layers for the current state ->
+    # display. ``tick_state_machine`` owns all input-driven state changes,
+    # velocity-buffer bookkeeping, swing detection, and scoring, so the loop only
+    # feeds it inputs and renders the result. The loop exits when the tick
+    # returns ``'exit'`` (Escape from any state, or any key at GAME_OVER).
+    # Swing detection/scoring and the trajectory preview are wired in task 10.4;
+    # exhaustive exit-path cleanup is hardened in task 10.3.
+    # The whole frame loop is wrapped in ``try`` so the ``finally`` block below
+    # runs cleanup on *every* exit path (task 10.3): a normal ``break`` (Escape
+    # from any state, or any key at GAME_OVER), an unexpected exception raised
+    # mid-loop, or a ``KeyboardInterrupt`` (Ctrl+C). Escape stays prompt because
+    # ``cv2.waitKey(1)`` is non-blocking and ``tick_state_machine`` returns
+    # ``'exit'`` on KEY_ESCAPE from any state, so the loop breaks within one
+    # frame (well under the 2s bound of Requirement 14.8).
+    prev_time = time.time()
+    try:
+        while True:
+            # Capture a frame; on a failed read skip this iteration and retry on
+            # the next cycle (transient webcam hiccup) rather than tearing down
+            # the loop.
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Mirror the frame for a natural "selfie" orientation, then resize it
+            # to the window so it matches the coordinate transform and SVG
+            # overlays.
+            frame = cv2.flip(frame, 1)
+            frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
+
+            # Detect the hand on the RGB view of the mirrored frame.
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            landmarks = detect_landmarks(landmarker, frame_rgb)
+
+            # Palm center in reference coordinates for racket rendering only; the
+            # velocity buffer is fed by tick_state_machine, so the loop must not
+            # push here. ``None`` when no hand is detected hides the racket.
+            if landmarks is not None:
+                palm_center = compute_palm_center(
+                    landmarks,
+                    CoordinateTransform.REF_WIDTH,
+                    CoordinateTransform.REF_HEIGHT,
+                )
+            else:
+                palm_center = None
+
+            # Frame timing with delta-time clamping to keep ball physics stable.
+            current_time = time.time()
+            dt = compute_dt(prev_time, current_time)
+            prev_time = current_time
+
+            # Poll input. Normalize so "no key" stays -1 (KEY_NONE) while any
+            # real key is masked to its low byte to match the state machine's key
+            # codes.
+            raw_key = cv2.waitKey(1)
+            key = raw_key if raw_key == -1 else (raw_key & 0xFF)
+
+            # During speed selection (before the countdown starts) sync the speed
+            # trackbar into the context so the chosen fall speed is used for the
+            # round. Once the countdown is running the speed is locked in.
+            if ctx.state == GameState.WAIT_COUNTDOWN and not ctx.countdown_active:
+                ctx.ball_speed = cv2.getTrackbarPos(
+                    TRACKBAR_SPEED_NAME, WINDOW_NAME
+                )
+
+            # On the LICENSE acceptance screen let the LicenseScreen handle
+            # scroll keys; tick_state_machine still consumes Enter (advance) and
+            # Escape (exit) for the actual state transitions.
+            if ctx.state == GameState.LICENSE:
+                license_screen.handle_input(key)
+
+            # Advance the state machine. It performs hand-tracking bookkeeping,
+            # the in-game license overlay, Escape-to-quit, the pause toggle, and
+            # every per-state transition (including swing detection and scoring).
+            action = tick_state_machine(ctx, dt, landmarks, key, current_time)
+
+            # Composite the frame for the current state (back-to-front).
+            state = ctx.state
+            if state == GameState.LICENSE:
+                license_screen.render(frame)
+            elif state == GameState.TUTORIAL:
+                render_svg_layers(ctx, frame, svg_loader, palm_center)
+                tutorial = ctx.tutorial_system
+                if tutorial is not None:
+                    if tutorial.tutorial_ball is not None:
+                        render_balls_layer(
+                            frame, [tutorial.tutorial_ball], svg_loader,
+                            ctx.coord_transform,
+                        )
+                    if tutorial.phase == TutorialPhase.SPOTLIGHT_PAUSE and \
+                            tutorial.tutorial_ball is not None:
+                        ball_center = ctx.coord_transform.ref_to_screen(
+                            tutorial.tutorial_ball.x, tutorial.tutorial_ball.y
+                        )
+                        tutorial.render_spotlight(
+                            frame, ball_center, tutorial.SPOTLIGHT_RADIUS
+                        )
+                        _render_tutorial_message(
+                            frame, tutorial, tutorial.SPOTLIGHT_MESSAGE
+                        )
+                    elif tutorial.phase == TutorialPhase.COMPLETE:
+                        _render_tutorial_message(
+                            frame, tutorial, tutorial.COMPLETE_MESSAGE
+                        )
+            elif state == GameState.WAIT_COUNTDOWN:
+                render_svg_layers(ctx, frame, svg_loader, palm_center)
+                if ctx.countdown_active and ctx.countdown_value is not None:
+                    render_countdown(
+                        frame, ctx.countdown_value, WINDOW_WIDTH, WINDOW_HEIGHT
+                    )
+                else:
+                    render_speed_selection(frame, ctx.ball_speed)
+            elif state in (GameState.BALL_FALLING, GameState.SWING_DETECT,
+                           GameState.RESULT):
+                render_svg_layers(ctx, frame, svg_loader, palm_center)
+                # Swing trajectory preview: draw a short line from the racket in
+                # the swing direction whenever the hand is tracked and moving.
+                # render_trajectory no-ops on its own when the speed is at/below
+                # the 200 px/s threshold, so no extra guard is needed here. It is
+                # drawn after the SVG layers (over the racket/balls) but before
+                # the score/timer HUD text so the readouts stay on top.
+                if palm_center is not None and ctx.velocity_buffer is not None:
+                    vel = ctx.velocity_buffer.compute_velocity()
+                    if vel is not None:
+                        render_trajectory(
+                            frame, palm_center, vel, ctx.coord_transform
+                        )
+                render_score(frame, ctx.score)
+                render_timer(frame, ctx.round_time_remaining, WINDOW_WIDTH)
+                if ctx.flash_effect is not None and \
+                        ctx.flash_effect[1] > current_time:
+                    render_flash(frame, ctx.flash_effect[0])
+                if ctx.paused:
+                    render_pause_indicator(frame, WINDOW_WIDTH, WINDOW_HEIGHT)
+            elif state == GameState.GAME_OVER:
+                render_game_over(frame, ctx.score, WINDOW_WIDTH, WINDOW_HEIGHT)
+
+            # The read-only in-game license overlay ('A' key) draws over whatever
+            # gameplay frame is underneath it.
+            if ctx.license_overlay_active:
+                license_screen.render_overlay(frame)
+
+            cv2.imshow(WINDOW_NAME, frame)
+
+            if action == "exit":
+                break
+    finally:
+        # --- resource cleanup on ALL exit paths (task 10.3) ---
+        # This runs whether the loop exited via a normal ``break``, an exception
+        # raised mid-loop, or a KeyboardInterrupt. Each release is guarded so a
+        # single failing call cannot prevent the others: the MediaPipe
+        # landmarker is closed first (only if it was created), then the webcam
+        # capture is released, then all OpenCV windows are destroyed -- in that
+        # order. All three calls are idempotent/defensive.
+        if landmarker is not None:
+            try:
+                landmarker.close()
+            except Exception:
+                # Cleanup must be best-effort; ignore secondary errors so the
+                # remaining resources still get released.
+                pass
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
+def _render_tutorial_message(frame, tutorial, text):
+    """Render a tutorial caption horizontally centered near the frame bottom.
+
+    Measures ``text`` with the tutorial system's font so it can be centered on
+    the window width, then delegates the actual drawing (outlined white glyphs)
+    to :meth:`TutorialSystem.render_instructions`. ``frame`` is modified
+    in-place.
+    """
+    (text_w, _), _ = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, tutorial._FONT_SCALE,
+        tutorial._FONT_THICKNESS,
+    )
+    position = ((WINDOW_WIDTH - text_w) // 2, WINDOW_HEIGHT - 80)
+    tutorial.render_instructions(frame, text, position)
+
+
+if __name__ == "__main__":
+    main()
