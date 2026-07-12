@@ -255,7 +255,7 @@ class FallingBall:
 
 
 class GameState(Enum):
-    """The eight discrete states of the game's finite state machine.
+    """The seven discrete states of the game's finite state machine.
 
     An orthogonal ``paused`` flag on :class:`GameContext` freezes the
     time-dependent active states without adding a distinct enum member.
