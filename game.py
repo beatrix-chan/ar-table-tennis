@@ -1484,6 +1484,12 @@ def _tick_tutorial(ctx, dt, landmarks, key):
         ctx.state = GameState.WAIT_COUNTDOWN
         return None
 
+    # Check for 'q' or 'Q' to exit tutorial early (line 1466-1492)
+    if key == ord('q') or key == ord('Q'):
+        ctx.tutorial_done = True
+        ctx.state = GameState.WAIT_COUNTDOWN
+        return None
+
     _maybe_hit_tutorial_ball(ctx, landmarks)
     action = ctx.tutorial_system.update(dt, key)
     if action == "complete":
@@ -1528,8 +1534,12 @@ def _maybe_hit_tutorial_ball(ctx, landmarks):
     )
     ball_radius = (BALL_SIZE_RATIO * CoordinateTransform.REF_WIDTH) / 2
     collision_radius = ball_radius + 30
+    if tutorial.tutorial_ball is not None:
+        distance = compute_distance(palm_center, tutorial.tutorial_ball.center)
+        print(f"DEBUG: Palm={palm_center}, Ball={tutorial.tutorial_ball.center}, Dist={distance:.1f}, CollRad={collision_radius:.1f}, VelMag={magnitude:.1f}")
     if evaluate_hit(palm_center, (vx, vy), tutorial.tutorial_ball, collision_radius):
         tutorial.tutorial_ball = None
+        print("DEBUG: Tutorial ball hit!")
 
 
 def _tick_wait_countdown(ctx, key, current_time):
