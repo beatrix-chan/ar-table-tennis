@@ -2259,8 +2259,8 @@ def main():
             # Poll input. Normalize so "no key" stays -1 (KEY_NONE) while any
             # real key is masked to its low byte to match the state machine's key
             # codes.
-            raw_key = cv2.waitKey(1)
-            key = raw_key if raw_key == -1 else (raw_key & 0xFF)
+            raw_key = cv2.waitKeyEx(1)
+            key = raw_key if raw_key == -1 or raw_key > 255 else (raw_key & 0xFF)
 
             # During speed selection (before the countdown starts) sync the speed
             # trackbar into the context so the chosen fall speed is used for the
