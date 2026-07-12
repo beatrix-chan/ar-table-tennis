@@ -8,7 +8,7 @@
 
 **Real-time augmented reality table tennis with hand tracking**
 
-![Gameplay Screenshot](https://placehold.co/1080x768/1a1a1a/FFFFFF/png?text=Gameplay+Demo+Screenshot)
+> [Demo Video](https://youtu.be/_ov-N5kLVU8)
 
 Play solo table tennis in your living room! Swing your hand to hit falling balls and score points before the 3-minute timer runs out.
 
