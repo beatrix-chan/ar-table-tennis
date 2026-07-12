@@ -9,6 +9,8 @@ SVG assets.
 """
 
 import os
+import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1151,3 +1153,503 @@ class TutorialSystem:
             frame, text, position, self._FONT, self._FONT_SCALE,
             self._TEXT_COLOR, self._FONT_THICKNESS, cv2.LINE_AA,
         )
+
+
+# ---------------------------------------------------------------------------
+# Ball spawning and physics update (state machine helpers)
+# ---------------------------------------------------------------------------
+# Module-level functions that drive falling-ball creation and per-frame motion.
+# All positions are in the 1440x1024 reference coordinate space; balls spawn
+# along the table's top edge (y = 292) and are retired once they fall past the
+# table's bottom edge (y = 1000). A miss flash is triggered for each retired
+# ball so the player gets visual feedback for balls they failed to return.
+
+# Duration (seconds) that a flash overlay stays active. Kept within the
+# 150-250ms window specified by the design's visual-effects convention.
+MISS_FLASH_DURATION = 0.2
+
+
+def compute_dt(prev_time, current_time):
+    """Return the frame delta-time clamped to a safe maximum.
+
+    Clamping ``current_time - prev_time`` to at most 0.1 seconds prevents a
+    physics "explosion" when the frame rate drops (a large gap would otherwise
+    teleport balls far down the screen in a single update).
+    """
+    raw_dt = current_time - prev_time
+    return min(raw_dt, 0.1)
+
+
+def maybe_spawn_ball(ctx, current_time):
+    """Spawn a new falling ball when the spawn interval has elapsed.
+
+    A ball is created only if ``current_time - ctx.last_spawn_time`` has reached
+    ``ctx.next_spawn_interval``. New balls appear at a random horizontal position
+    along the table's top edge (x in [396, 1043], y = 292) and inherit the
+    current ``ctx.ball_speed``. Ball color alternates via ``ctx.ball_spawn_counter``
+    ("white" on even counts, "orange" on odd counts). After spawning, the counter
+    is incremented, the spawn clock is reset, and the next interval is randomized
+    within [1.5, 2.5] seconds.
+    """
+    if current_time - ctx.last_spawn_time >= ctx.next_spawn_interval:
+        # Table top x-bounds in reference space: 396 (left) .. 1043 (right).
+        x_left, x_right = TABLE_TOP_LEFT[0], TABLE_TOP_RIGHT[0]
+        x = random.uniform(x_left, x_right)
+        ball_type = "white" if ctx.ball_spawn_counter % 2 == 0 else "orange"
+        ctx.balls.append(
+            FallingBall(x=x, y=292.0, speed=ctx.ball_speed, ball_type=ball_type)
+        )
+        ctx.ball_spawn_counter += 1
+        ctx.last_spawn_time = current_time
+        ctx.next_spawn_interval = random.uniform(1.5, 2.5)
+
+
+def update_balls(ctx, dt):
+    """Advance every active ball and retire those that fall off the table.
+
+    Each ball's vertical position is advanced by ``dt`` (the caller must supply a
+    pre-clamped delta-time via :func:`compute_dt`). Balls whose y-coordinate
+    passes the table's bottom edge (y > 1000) are removed from ``ctx.balls`` and
+    treated as misses: a red flash effect is armed for each retired ball so the
+    player sees feedback for the missed return.
+    """
+    for ball in ctx.balls:
+        ball.update(dt)
+
+    remaining = []
+    missed = False
+    for ball in ctx.balls:
+        if ball.is_past_table_bottom():
+            missed = True
+        else:
+            remaining.append(ball)
+    ctx.balls = remaining
+
+    if missed:
+        # Arm a red "miss" flash; the render layer compares the expire timestamp
+        # against the current clock to decide when to stop drawing it.
+        ctx.flash_effect = ("red", time.time() + MISS_FLASH_DURATION)
+
+# ---------------------------------------------------------------------------
+# Pause handling and license overlay logic
+# ---------------------------------------------------------------------------
+# Module-level helpers that implement the game's orthogonal PAUSED behavior and
+# the read-only in-game license overlay. Neither pause nor the overlay is a
+# distinct state in :class:`GameState`; both are flags on :class:`GameContext`
+# that freeze the time-dependent gameplay updates while leaving the underlying
+# state intact for seamless resumption. These helpers are pure functions of
+# ``(ctx, key)`` (plus a predicate over ``ctx``) so ``tick_state_machine``
+# (task 6.1) can dispatch input and gate updates cleanly.
+
+# Key codes (cv2.waitKey values) recognized by the pause/overlay handlers.
+KEY_NONE = -1  # cv2.waitKey timeout: no key pressed this frame
+KEY_SPACE = 32  # Spacebar toggles pause during an active round
+KEY_A_LOWER = 97  # 'a' opens the license overlay
+KEY_A_UPPER = 65  # 'A' opens the license overlay
+
+# States during which Spacebar is allowed to toggle the pause flag. In every
+# other state (LICENSE, TUTORIAL, WAIT_COUNTDOWN, GAME_OVER) Spacebar is ignored
+# and the pause flag is left untouched.
+PAUSE_TOGGLE_STATES = (
+    GameState.BALL_FALLING,
+    GameState.SWING_DETECT,
+    GameState.RESULT,
+)
+
+
+def is_gameplay_active(ctx):
+    """Return whether time-dependent gameplay updates should run this frame.
+
+    Gameplay is "active" only when neither the pause flag nor the license
+    overlay is engaged. When this returns ``False`` the caller
+    (:func:`tick_state_machine`) must skip applying ``dt`` to the round timer,
+    skip advancing/removing balls, and skip spawning new balls. Hand tracking
+    and rendering continue regardless, so the player still sees their live feed
+    (and the racket) while paused or while reading the license overlay.
+    """
+    return not ctx.paused and not ctx.license_overlay_active
+
+
+def handle_pause_input(ctx, key):
+    """Toggle the pause flag in response to Spacebar during an active round.
+
+    Spacebar (``key == 32``) flips ``ctx.paused`` only while ``ctx.state`` is one
+    of :data:`PAUSE_TOGGLE_STATES` (BALL_FALLING, SWING_DETECT, RESULT). In every
+    other state the key is ignored and ``ctx.paused`` is left unchanged. The
+    toggle is also suppressed while the license overlay is active, because in
+    that mode any key is consumed to dismiss the overlay (see
+    :func:`handle_license_overlay_input`). Returns ``True`` if the pause flag was
+    toggled, ``False`` otherwise.
+    """
+    if key != KEY_SPACE:
+        return False
+    if ctx.license_overlay_active:
+        return False
+    if ctx.state not in PAUSE_TOGGLE_STATES:
+        return False
+    ctx.paused = not ctx.paused
+    return True
+
+
+def handle_license_overlay_input(ctx, key):
+    """Open or dismiss the read-only in-game license overlay.
+
+    Behavior depends on whether the overlay is already showing:
+
+    * **Overlay active:** any key press (``key != -1``) dismisses it by setting
+      ``ctx.license_overlay_active = False``. Because the overlay gates gameplay
+      via :func:`is_gameplay_active` (rather than mutating ``ctx.paused``),
+      dismissing it automatically restores whatever gameplay state was in effect
+      beforehand -- if the round was paused before the overlay opened it stays
+      paused, otherwise play resumes. Returns ``"dismissed"``.
+    * **Overlay inactive:** pressing 'A' (``key == 97`` or ``key == 65``) opens
+      the overlay by setting ``ctx.license_overlay_active = True``. This pauses
+      gameplay for the duration of the overlay through the
+      :func:`is_gameplay_active` gate, without disturbing the underlying
+      ``ctx.paused`` flag. Returns ``"opened"``.
+
+    Returns ``"none"`` when no overlay action is taken.
+    """
+    if ctx.license_overlay_active:
+        if key != KEY_NONE:
+            ctx.license_overlay_active = False
+            return "dismissed"
+        return "none"
+    if key in (KEY_A_LOWER, KEY_A_UPPER):
+        ctx.license_overlay_active = True
+        return "opened"
+    return "none"
+
+
+# ---------------------------------------------------------------------------
+# State machine tick (per-frame dispatch)
+# ---------------------------------------------------------------------------
+# ``tick_state_machine`` is the single entry point the main loop calls once per
+# frame. It advances the game's finite state machine by dispatching to a
+# per-state handler after applying the orthogonal concerns that cut across every
+# state: hand tracking (velocity buffer), the read-only in-game license overlay,
+# the global Escape-to-quit control, and the Spacebar pause toggle.
+#
+# All game logic operates in the 1440x1024 reference space, so the palm center
+# pushed to the velocity buffer is computed against the reference dimensions
+# (not the raw webcam frame size). This keeps hand velocity in reference px/s,
+# directly comparable to the swing threshold and to ball positions used by the
+# collision and scoring evaluators.
+#
+# The function returns ``'exit'`` when the application should terminate (Escape
+# from any state, or any key while in GAME_OVER) and ``None`` otherwise.
+
+# Key codes recognized by the state machine (cv2.waitKey values).
+KEY_ENTER = 13    # accept license / advance tutorial / start countdown
+KEY_ESCAPE = 27   # quit from any state
+
+# Countdown length: 3 -> 2 -> 1, one second per number (Requirement 8.2).
+COUNTDOWN_SECONDS = 3
+
+# Duration (seconds) a hit/no-score flash stays armed. Kept within the
+# 150-250ms window from the design's visual-effects convention.
+HIT_FLASH_DURATION = 0.2
+
+
+def tick_state_machine(ctx, dt, landmarks, key, current_time):
+    """Advance the game state machine by one frame and return an action signal.
+
+    Parameters
+    ----------
+    ctx : GameContext
+        The mutable game state; updated in-place.
+    dt : float
+        Frame delta-time in seconds, already clamped by :func:`compute_dt`.
+    landmarks : Optional[list]
+        The 21 hand landmarks for the tracked hand, or ``None`` when no hand is
+        detected this frame.
+    key : int
+        The latest key code from ``cv2.waitKey`` (``-1`` when no key pressed).
+    current_time : float
+        The current wall-clock timestamp (``time.time()``), used for countdown
+        timing, ball spawning, and flash-effect expiry.
+
+    Returns
+    -------
+    Optional[str]
+        ``'exit'`` if the application should terminate, otherwise ``None``.
+
+    The dispatch order is: (1) update hand tracking regardless of state so the
+    velocity buffer stays fresh, (2) service the in-game license overlay (which
+    freezes the tick while shown), (3) honor the global Escape-to-quit control,
+    (4) apply the Spacebar pause toggle, then (5) run the handler for the current
+    :class:`GameState`. Timer expiry (``round_time_remaining <= 0``) during any
+    active state overrides all other transitions and forces GAME_OVER.
+    """
+    # (1) Hand tracking continues regardless of pause, overlay, or state so the
+    # velocity buffer is warm the moment a swing must be evaluated. The palm
+    # center is expressed in reference space (1440x1024) to match ball
+    # coordinates and the swing velocity threshold.
+    if ctx.velocity_buffer is not None:
+        if landmarks is None:
+            ctx.velocity_buffer.mark_lost()
+        else:
+            palm_center = compute_palm_center(
+                landmarks,
+                CoordinateTransform.REF_WIDTH,
+                CoordinateTransform.REF_HEIGHT,
+            )
+            ctx.velocity_buffer.push(palm_center, current_time)
+
+    # (2) Read-only in-game license overlay ('A' to open, any key to dismiss).
+    # It is not applicable to the initial LICENSE acceptance screen, which has
+    # its own full-screen rendering. While the overlay is showing, the whole
+    # tick is frozen (no timer, ball, or transition updates) and control returns
+    # immediately so gameplay resumes exactly where it left off on dismissal.
+    if ctx.state != GameState.LICENSE:
+        overlay_action = handle_license_overlay_input(ctx, key)
+        if overlay_action in ("opened", "dismissed") or ctx.license_overlay_active:
+            return None
+
+    # (3) Global quit: Escape terminates from any state (Requirement 14.1).
+    if key == KEY_ESCAPE:
+        return "exit"
+
+    # (4) Spacebar pause toggle (only honored during active rounds; ignored in
+    # LICENSE/TUTORIAL/WAIT_COUNTDOWN/GAME_OVER by handle_pause_input).
+    handle_pause_input(ctx, key)
+
+    # (5) Per-state dispatch.
+    state = ctx.state
+    if state == GameState.LICENSE:
+        return _tick_license(ctx, key)
+    if state == GameState.TUTORIAL:
+        return _tick_tutorial(ctx, dt, key)
+    if state == GameState.WAIT_COUNTDOWN:
+        return _tick_wait_countdown(ctx, key, current_time)
+    if state == GameState.BALL_FALLING:
+        return _tick_ball_falling(ctx, dt, current_time)
+    if state == GameState.SWING_DETECT:
+        return _tick_swing_detect(ctx, dt, landmarks, current_time)
+    if state == GameState.RESULT:
+        return _tick_result(ctx, dt, current_time)
+    if state == GameState.GAME_OVER:
+        return _tick_game_over(ctx, key)
+    return None
+
+
+def _tick_license(ctx, key):
+    """Handle the LICENSE acceptance screen.
+
+    Pressing Enter records acceptance and transitions to TUTORIAL on first
+    launch (tutorial not yet done) or straight to WAIT_COUNTDOWN on subsequent
+    launches. Escape is handled globally in :func:`tick_state_machine` as a
+    quit, so it never reaches this handler. Returns ``None`` (no exit signal).
+    """
+    if key == KEY_ENTER:
+        ctx.license_accepted = True
+        if ctx.tutorial_done:
+            ctx.state = GameState.WAIT_COUNTDOWN
+        else:
+            ctx.state = GameState.TUTORIAL
+    return None
+
+
+def _tick_tutorial(ctx, dt, key):
+    """Handle the guided TUTORIAL state.
+
+    Delegates to :meth:`TutorialSystem.update`, which advances the ball
+    descend -> spotlight -> resume -> practice sequence, consumes Enter to
+    advance steps, and persists the ``.tutorial_done`` marker when the player
+    presses Enter at the completion prompt (returning ``'complete'``). On
+    completion this handler marks the tutorial done in the context and
+    transitions to WAIT_COUNTDOWN. Returns ``None``.
+    """
+    if ctx.tutorial_system is None:
+        # No tutorial configured: skip straight to the countdown wait.
+        ctx.tutorial_done = True
+        ctx.state = GameState.WAIT_COUNTDOWN
+        return None
+
+    action = ctx.tutorial_system.update(dt, key)
+    if action == "complete":
+        ctx.tutorial_done = True
+        ctx.state = GameState.WAIT_COUNTDOWN
+    return None
+
+
+def _tick_wait_countdown(ctx, key, current_time):
+    """Handle the WAIT_COUNTDOWN state (speed selection + 3-2-1 countdown).
+
+    While the countdown is not yet active the player adjusts the speed trackbar
+    (read by the main loop) and presses Enter to start the countdown, which arms
+    ``countdown_active``, seeds ``countdown_value`` to 3, and records
+    ``countdown_start_time``. Once active, the displayed value is derived from
+    the elapsed wall-clock time (one second per number); when the full
+    :data:`COUNTDOWN_SECONDS` has elapsed the round begins: the state moves to
+    BALL_FALLING, the round timer is (re)initialized to ``round_duration``, and
+    ball-spawn timing is primed so the first ball is not spawned instantly.
+    Returns ``None``.
+    """
+    if not ctx.countdown_active:
+        if key == KEY_ENTER:
+            ctx.countdown_active = True
+            ctx.countdown_value = COUNTDOWN_SECONDS
+            ctx.countdown_start_time = current_time
+        return None
+
+    elapsed = current_time - ctx.countdown_start_time
+    if elapsed >= COUNTDOWN_SECONDS:
+        # Countdown finished: start the round.
+        ctx.countdown_active = False
+        ctx.countdown_value = None
+        ctx.countdown_start_time = None
+        ctx.round_time_remaining = ctx.round_duration
+        ctx.last_spawn_time = current_time
+        ctx.next_spawn_interval = random.uniform(1.5, 2.5)
+        ctx.state = GameState.BALL_FALLING
+    else:
+        # Display 3 during [0,1), 2 during [1,2), 1 during [2,3).
+        ctx.countdown_value = COUNTDOWN_SECONDS - int(elapsed)
+    return None
+
+
+def _advance_round_timer(ctx, dt):
+    """Decrement the round timer by ``dt`` and force GAME_OVER on expiry.
+
+    Subtracts the clamped frame delta-time from ``round_time_remaining`` (floored
+    at 0). When the timer reaches 0 the state is switched to GAME_OVER and
+    ``True`` is returned so the caller can stop further per-frame work; otherwise
+    returns ``False``. This centralizes the timer-expiry override shared by the
+    active states (BALL_FALLING, SWING_DETECT, RESULT).
+    """
+    ctx.round_time_remaining = max(0.0, ctx.round_time_remaining - dt)
+    if ctx.round_time_remaining <= 0:
+        ctx.state = GameState.GAME_OVER
+        return True
+    return False
+
+
+def _tick_ball_falling(ctx, dt, current_time):
+    """Handle the BALL_FALLING state.
+
+    When gameplay is active (not paused, no overlay) the round timer advances,
+    balls fall and retire past the table bottom via :func:`update_balls`, and new
+    balls spawn via :func:`maybe_spawn_ball`. Timer expiry overrides everything
+    and forces GAME_OVER. If any active ball has entered the Player_Zone
+    (``y > 622``) the state transitions to SWING_DETECT so the swing can be
+    evaluated. While paused or while the overlay is shown, no time-dependent
+    update runs. Returns ``None``.
+    """
+    if not is_gameplay_active(ctx):
+        return None
+    if _advance_round_timer(ctx, dt):
+        return None
+    update_balls(ctx, dt)
+    maybe_spawn_ball(ctx, current_time)
+    if any(ball.is_in_player_zone() for ball in ctx.balls):
+        ctx.state = GameState.SWING_DETECT
+    return None
+
+
+def _tick_swing_detect(ctx, dt, landmarks, current_time):
+    """Handle the SWING_DETECT state.
+
+    Physics continues exactly as in BALL_FALLING (timer, ball motion, spawning,
+    miss handling) so balls are never frozen while waiting for a swing. When a
+    hand is tracked the swing velocity is computed from the velocity buffer and,
+    if the motion classifies as an active swing (fast enough and palm facing the
+    camera), every Player_Zone ball is evaluated independently via
+    :func:`evaluate_all_balls`. If one or more balls are hit, the hit balls and
+    the swing velocity are stashed on the context for the RESULT state to score
+    and the state transitions to RESULT. If no hit occurs and no ball remains in
+    the Player_Zone, the state returns to BALL_FALLING. Timer expiry forces
+    GAME_OVER. Returns ``None``.
+
+    The pending hit balls and velocity are stored as ``_pending_hits`` and
+    ``_pending_velocity`` attributes so they survive the one-frame gap between
+    detecting the hit here and scoring it in :func:`_tick_result`.
+    """
+    if not is_gameplay_active(ctx):
+        return None
+    if _advance_round_timer(ctx, dt):
+        return None
+    update_balls(ctx, dt)
+    maybe_spawn_ball(ctx, current_time)
+
+    hit_balls = []
+    velocity = None
+    if landmarks is not None and ctx.velocity_buffer is not None:
+        vel_result = ctx.velocity_buffer.compute_velocity()
+        if vel_result is not None:
+            vx, vy, magnitude = vel_result
+            palm_normal = compute_palm_normal(landmarks)
+            if classify_swing(magnitude, palm_normal):
+                palm_center = compute_palm_center(
+                    landmarks,
+                    CoordinateTransform.REF_WIDTH,
+                    CoordinateTransform.REF_HEIGHT,
+                )
+                velocity = (vx, vy)
+                hit_balls = evaluate_all_balls(palm_center, velocity, ctx.balls)
+
+    if hit_balls:
+        ctx._pending_hits = hit_balls
+        ctx._pending_velocity = velocity
+        ctx.state = GameState.RESULT
+        return None
+
+    # No hit this frame: keep detecting while balls remain in the Player_Zone,
+    # otherwise fall back to spawning/falling.
+    if not any(ball.is_in_player_zone() for ball in ctx.balls):
+        ctx.state = GameState.BALL_FALLING
+    return None
+
+
+def _tick_result(ctx, dt, current_time):
+    """Handle the RESULT state (scoring + flash) then return to BALL_FALLING.
+
+    For each ball hit during SWING_DETECT the scoring pipeline
+    (:func:`evaluate_score`) projects the swing to a landing position; a point is
+    awarded when the landing falls inside the Opponent_Zone. Every evaluated ball
+    is removed from the active list. A flash effect is armed for feedback: green
+    when at least one point was scored, yellow when balls were hit but none
+    scored (matching Requirements 11.4/11.5 and the design's flash convention;
+    red flashes are reserved for missed balls that fall past the table bottom and
+    are handled in :func:`update_balls`). The timer still advances during this
+    frame and expiry forces GAME_OVER; otherwise the state returns to
+    BALL_FALLING. Returns ``None``.
+    """
+    if not is_gameplay_active(ctx):
+        return None
+    if _advance_round_timer(ctx, dt):
+        return None
+
+    hit_balls = getattr(ctx, "_pending_hits", [])
+    velocity = getattr(ctx, "_pending_velocity", None)
+
+    scored = False
+    for ball in hit_balls:
+        if velocity is not None and evaluate_score(ball.center, velocity):
+            ctx.score += 1
+            scored = True
+        if ball in ctx.balls:
+            ctx.balls.remove(ball)
+
+    if hit_balls:
+        color = "green" if scored else "yellow"
+        ctx.flash_effect = (color, current_time + HIT_FLASH_DURATION)
+
+    # Clear the pending hit hand-off and resume falling.
+    ctx._pending_hits = []
+    ctx._pending_velocity = None
+    ctx.state = GameState.BALL_FALLING
+    return None
+
+
+def _tick_game_over(ctx, key):
+    """Handle the GAME_OVER state.
+
+    The final score display is drawn by the renderer; this handler only waits
+    for input. Any key press (``key != -1``) terminates the application by
+    returning ``'exit'``. Escape is already handled as a global quit in
+    :func:`tick_state_machine`. Returns ``None`` while waiting.
+    """
+    if key != KEY_NONE:
+        return "exit"
+    return None
